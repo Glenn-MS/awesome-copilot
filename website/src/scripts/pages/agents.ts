@@ -2,15 +2,16 @@
  * Agents page functionality
  */
 import { createChoices, getChoicesValues, type Choices } from '../choices';
-import { FuzzySearch, SearchItem } from '../search';
-import { fetchData, debounce, escapeHtml, getGitHubUrl, getInstallDropdownHtml, setupDropdownCloseHandlers, getActionButtonsHtml, setupActionHandlers } from '../utils';
+import { FuzzySearch, type SearchItem } from '../search';
+import { fetchData, debounce, setupDropdownCloseHandlers, setupActionHandlers } from '../utils';
 import { setupModal, openFileModal } from '../modal';
+import { renderAgentsHtml, sortAgents, type AgentSortOption, type RenderableAgent } from './agents-render';
 
-interface Agent extends SearchItem {
-  path: string;
-  model?: string;
+interface Agent extends SearchItem, RenderableAgent {
+  model?: string | string[];
   tools?: string[];
   hasHandoffs?: boolean;
+  lastUpdated?: string | null;
 }
 
 interface AgentsData {
@@ -21,17 +22,22 @@ interface AgentsData {
   };
 }
 
-const resourceType = 'agent';
 let allItems: Agent[] = [];
 let search = new FuzzySearch<Agent>();
 let modelSelect: Choices;
 let toolSelect: Choices;
+let currentSort: AgentSortOption = 'title';
+let resourceListHandlersReady = false;
 
 let currentFilters = {
   models: [] as string[],
   tools: [] as string[],
   hasHandoffs: false,
 };
+
+function sortItems(items: Agent[]): Agent[] {
+  return sortAgents(items, currentSort);
+}
 
 function applyFiltersAndRender(): void {
   const searchInput = document.getElementById('search-input') as HTMLInputElement;
@@ -45,7 +51,7 @@ function applyFiltersAndRender(): void {
       if (currentFilters.models.includes('(none)') && !item.model) {
         return true;
       }
-      return item.model && currentFilters.models.includes(item.model);
+      return item.model && (Array.isArray(item.model) ? item.model.some(m => currentFilters.models.includes(m)) : currentFilters.models.includes(item.model));
     });
   }
 
@@ -58,6 +64,9 @@ function applyFiltersAndRender(): void {
   if (currentFilters.hasHandoffs) {
     results = results.filter(item => item.hasHandoffs);
   }
+
+  // Apply sorting
+  results = sortItems(results);
 
   renderItems(results, query);
 
@@ -77,45 +86,29 @@ function renderItems(items: Agent[], query = ''): void {
   const list = document.getElementById('resource-list');
   if (!list) return;
 
-  if (items.length === 0) {
-    list.innerHTML = `
-      <div class="empty-state">
-        <h3>No agents found</h3>
-        <p>Try a different search term or adjust filters</p>
-      </div>
-    `;
-    return;
-  }
-
-  list.innerHTML = items.map(item => `
-    <div class="resource-item" data-path="${escapeHtml(item.path)}">
-      <div class="resource-info">
-        <div class="resource-title">${query ? search.highlight(item.title, query) : escapeHtml(item.title)}</div>
-        <div class="resource-description">${escapeHtml(item.description || 'No description')}</div>
-        <div class="resource-meta">
-          ${item.model ? `<span class="resource-tag tag-model">${escapeHtml(item.model)}</span>` : ''}
-          ${item.tools?.slice(0, 3).map(t => `<span class="resource-tag">${escapeHtml(t)}</span>`).join('') || ''}
-          ${item.tools && item.tools.length > 3 ? `<span class="resource-tag">+${item.tools.length - 3} more</span>` : ''}
-          ${item.hasHandoffs ? `<span class="resource-tag tag-handoffs">handoffs</span>` : ''}
-        </div>
-      </div>
-      <div class="resource-actions">
-        ${getInstallDropdownHtml(resourceType, item.path, true)}
-        ${getActionButtonsHtml(item.path, true)}
-        <a href="${getGitHubUrl(item.path)}" class="btn btn-secondary btn-small" target="_blank" onclick="event.stopPropagation()" title="View on GitHub">
-          GitHub
-        </a>
-      </div>
-    </div>
-  `).join('');
-
-  // Add click handlers
-  list.querySelectorAll('.resource-item').forEach(el => {
-    el.addEventListener('click', () => {
-      const path = (el as HTMLElement).dataset.path;
-      if (path) openFileModal(path, resourceType);
-    });
+  list.innerHTML = renderAgentsHtml(items, {
+    query,
+    highlightTitle: (title, highlightQuery) => search.highlight(title, highlightQuery),
   });
+}
+
+function setupResourceListHandlers(list: HTMLElement | null): void {
+  if (!list || resourceListHandlersReady) return;
+
+  list.addEventListener('click', (event) => {
+    const target = event.target as HTMLElement;
+    if (target.closest('.resource-actions')) {
+      return;
+    }
+
+    const item = target.closest('.resource-item') as HTMLElement | null;
+    const path = item?.dataset.path;
+    if (path) {
+      openFileModal(path, 'agent');
+    }
+  });
+
+  resourceListHandlersReady = true;
 }
 
 export async function initAgentsPage(): Promise<void> {
@@ -123,6 +116,9 @@ export async function initAgentsPage(): Promise<void> {
   const searchInput = document.getElementById('search-input') as HTMLInputElement;
   const handoffsCheckbox = document.getElementById('filter-handoffs') as HTMLInputElement;
   const clearFiltersBtn = document.getElementById('clear-filters');
+  const sortSelect = document.getElementById('sort-select') as HTMLSelectElement;
+
+  setupResourceListHandlers(list as HTMLElement | null);
 
   const data = await fetchData<AgentsData>('agents.json');
   if (!data || !data.items) {
@@ -149,7 +145,16 @@ export async function initAgentsPage(): Promise<void> {
     applyFiltersAndRender();
   });
 
-  applyFiltersAndRender();
+  // Initialize sort select
+  sortSelect?.addEventListener('change', () => {
+    currentSort = sortSelect.value as AgentSortOption;
+    applyFiltersAndRender();
+  });
+
+  const countEl = document.getElementById('results-count');
+  if (countEl) {
+    countEl.textContent = `${allItems.length} of ${allItems.length} agents`;
+  }
 
   searchInput?.addEventListener('input', debounce(() => applyFiltersAndRender(), 200));
 
@@ -160,10 +165,12 @@ export async function initAgentsPage(): Promise<void> {
 
   clearFiltersBtn?.addEventListener('click', () => {
     currentFilters = { models: [], tools: [], hasHandoffs: false };
+    currentSort = 'title';
     modelSelect.removeActiveItems();
     toolSelect.removeActiveItems();
     if (handoffsCheckbox) handoffsCheckbox.checked = false;
     if (searchInput) searchInput.value = '';
+    if (sortSelect) sortSelect.value = 'title';
     applyFiltersAndRender();
   });
 
